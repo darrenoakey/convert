@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import json
+import openai
+import time
+import subprocess
+import shutil
+import hashlib
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Type, TypeVar
+from pydantic import BaseModel, Field
+from colorama import Fore, Back, Style, init
+
+# Initialize colorama
+init(autoreset=True)
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class ConversionStrategy(BaseModel):
+    """Response model for getting conversion strategies from LLM"""
+
+    tools: List[str] = Field(
+        description="List of command line tools that can perform this conversion"
+    )
+    preferred_tool: str = Field(
+        description="The most recommended tool for this conversion"
+    )
+    explanation: str = Field(
+        description="Brief explanation of why this tool is recommended"
+    )
+
+
+class PythonConverter(BaseModel):
+    """Response model for Python converter code"""
+
+    code: str = Field(description="Complete Python code for the converter")
+    dependencies: List[str] = Field(description="List of Python packages required")
+    explanation: str = Field(description="Brief explanation of how the converter works")
+
+
+class PurePythonConverter(BaseModel):
+    """Response model for pure Python conversion without external tools"""
+
+    code: str = Field(
+        description="Complete Python code for conversion using only Python libraries"
+    )
+    dependencies: List[str] = Field(description="List of Python packages required")
+    explanation: str = Field(description="Brief explanation of the conversion method")
+    limitations: str = Field(description="Any limitations or quality considerations")
+
+
+class FixedConverter(BaseModel):
+    """Response model for fixed converter code after error"""
+
+    code: str = Field(description="Fixed Python code for the converter")
+    changes_made: str = Field(description="Explanation of what was fixed")
+
+
+class ConvertTool:
+    def __init__(self):
+        self.api_key = self.read_api_key()
+        self.script_dir = Path(__file__).parent
+        self.convert_data_dir = self.script_dir / "convert_data"
+        self.convert_data_dir.mkdir(exist_ok=True)
+        self.client = openai.OpenAI(api_key=self.api_key)
+
+    def read_api_key(self):
+        try:
+            with open(os.path.expanduser("~/.openai/openai_api_key.txt"), "r") as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            print(
+                f"{Fore.RED}Error: Unable to find the OpenAI API key file at '~/.openai/openai_api_key.txt'.{Style.RESET_ALL}"
+            )
+            sys.exit(1)
+
+    def ask_llm(self, prompt: str, response_type: Type[T], model: str = None) -> T:
+        """Clean interface: ask LLM with a prompt and get back typed result"""
+        print(f"{Fore.CYAN}🤖 Asking LLM: {prompt[:100]}...{Style.RESET_ALL}")
+
+        # Models that support structured outputs (in order of preference)
+        models_to_try = [
+            "gpt-4.1",
+            "gpt-4o-2024-08-06",
+            "gpt-4o-mini-2024-07-18",
+            "gpt-4o-mini",
+            "gpt-4o",
+        ]
+
+        if model:
+            models_to_try.insert(0, model)
+
+        # Try structured outputs first
+        for model_name in models_to_try:
+            try:
+                print(
+                    f"{Fore.CYAN}🔄 Trying {model_name} with structured outputs...{Style.RESET_ALL}"
+                )
+                completion = self.client.beta.chat.completions.parse(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format=response_type,
+                )
+
+                result = completion.choices[0].message.parsed
+                print(
+                    f"{Fore.GREEN}✅ Got typed response from {model_name}{Style.RESET_ALL}"
+                )
+                return result
+
+            except Exception as e:
+                print(
+                    f"{Fore.YELLOW}⚠️  {model_name} failed: {str(e)[:100]}...{Style.RESET_ALL}"
+                )
+                continue
+
+        # Fallback to JSON mode with manual parsing
+        print(
+            f"{Fore.YELLOW}🔄 Falling back to JSON mode with manual parsing{Style.RESET_ALL}"
+        )
+        try:
+            completion = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"You are a helpful assistant. Respond with valid JSON that matches this structure: {response_type.model_json_schema()}",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+
+            content = completion.choices[0].message.content
+            response_data = json.loads(content)
+            result = response_type.model_validate(response_data)
+            print(f"{Fore.GREEN}✅ Fallback JSON parsing succeeded{Style.RESET_ALL}")
+            return result
+
+        except Exception as final_error:
+            print(f"{Fore.RED}❌ All methods failed: {final_error}{Style.RESET_ALL}")
+            raise
+
+    def get_conversion_key(self, source_ext: str, target_ext: str) -> str:
+        """Generate a unique key for this conversion type"""
+        return f"{source_ext.lower()}_to_{target_ext.lower()}"
+
+    def get_converter_path(self, conversion_key: str) -> Path:
+        """Get the path where converter code is stored"""
+        return self.convert_data_dir / f"{conversion_key}.py"
+
+    def converter_exists(self, conversion_key: str) -> bool:
+        """Check if we already have a converter for this conversion"""
+        return self.get_converter_path(conversion_key).exists()
+
+    def get_conversion_strategy(
+        self, source_ext: str, target_ext: str
+    ) -> ConversionStrategy:
+        """Ask LLM for the best tools to convert between formats"""
+        prompt = f"""I need to convert files from {source_ext} to {target_ext}. 
+        What are the best command line tools for this conversion? 
+        List them in order of preference and explain why the preferred tool is best."""
+
+        return self.ask_llm(prompt, ConversionStrategy)
+
+    def is_tool_installed(self, tool_name: str) -> bool:
+        """Check if a command line tool is installed"""
+        try:
+            subprocess.run([tool_name, "--help"], capture_output=True, check=True)
+            print(f"{Fore.GREEN}✅ Found {tool_name}{Style.RESET_ALL}")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            print(f"{Fore.YELLOW}❌ {tool_name} not found{Style.RESET_ALL}")
+            return False
+
+    def get_python_wrapper(
+        self, tool_name: str, source_ext: str, target_ext: str
+    ) -> PythonConverter:
+        """Get Python wrapper code for a command line tool"""
+        prompt = f"""Create a Python script that wraps the {tool_name} command line tool to convert from {source_ext} to {target_ext}.
+
+Requirements:
+- Take source_file and target_file as sys.argv[1] and sys.argv[2]
+- Use subprocess to call {tool_name} with best-guess quality settings
+- Include proper error handling
+- Make it a complete, runnable script
+
+Return the complete Python code, dependencies needed, and explanation."""
+
+        return self.ask_llm(prompt, PythonConverter)
+
+    def get_pure_python_converter(
+        self, source_ext: str, target_ext: str
+    ) -> PurePythonConverter:
+        """Get pure Python conversion code without external tools"""
+        prompt = f"""Create a pure Python script to convert from {source_ext} to {target_ext} using only Python libraries like PIL, etc.
+
+Requirements:
+- Take source_file and target_file as sys.argv[1] and sys.argv[2]  
+- Use only standard Python libraries or common packages like PIL/Pillow
+- Include proper error handling and quality settings
+- Make it a complete, runnable script
+
+Return the complete Python code, dependencies, explanation, and any limitations."""
+
+        return self.ask_llm(prompt, PurePythonConverter)
+
+    def save_converter(self, conversion_key: str, code: str):
+        """Save converter code to file"""
+        converter_path = self.get_converter_path(conversion_key)
+        with open(converter_path, "w") as f:
+            f.write(code)
+        converter_path.chmod(0o755)  # Make executable
+        print(f"{Fore.GREEN}💾 Saved converter to {converter_path}{Style.RESET_ALL}")
+
+    def run_converter(
+        self, conversion_key: str, source_file: str, target_file: str
+    ) -> tuple[bool, str]:
+        """Run the converter and return (success, error_message)"""
+        converter_path = self.get_converter_path(conversion_key)
+
+        try:
+            result = subprocess.run(
+                [sys.executable, str(converter_path), source_file, target_file],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            # Check if target file was created
+            if os.path.exists(target_file):
+                print(
+                    f"{Fore.GREEN}✅ Conversion successful: {source_file} -> {target_file}{Style.RESET_ALL}"
+                )
+                return True, ""
+            else:
+                error_msg = "Converter ran but target file not created"
+                print(f"{Fore.YELLOW}⚠️  {error_msg}{Style.RESET_ALL}")
+                return False, error_msg
+
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Converter failed: {e.stderr}"
+            print(f"{Fore.RED}❌ {error_msg}{Style.RESET_ALL}")
+            return False, error_msg
+
+    def fix_converter(self, conversion_key: str, error_message: str) -> str:
+        """Ask LLM to fix converter code based on error"""
+        converter_path = self.get_converter_path(conversion_key)
+
+        with open(converter_path, "r") as f:
+            current_code = f.read()
+
+        prompt = f"""Fix this Python converter code that's failing:
+
+Current code:
+```python
+{current_code}
+```
+
+Error encountered: {error_message}
+
+Please provide the fixed Python code and explain what changes were made."""
+
+        fixed = self.ask_llm(prompt, FixedConverter)
+        print(f"{Fore.YELLOW}🔧 Fix applied: {fixed.changes_made}{Style.RESET_ALL}")
+        return fixed.code
+
+    def try_install_tool(self, tool_name: str) -> bool:
+        """Attempt to install a command line tool"""
+        print(f"{Fore.CYAN}📦 Attempting to install {tool_name}{Style.RESET_ALL}")
+
+        # Common installation methods
+        install_commands = [
+            ["brew", "install", tool_name],  # macOS
+            ["apt-get", "install", "-y", tool_name],  # Ubuntu/Debian
+            ["yum", "install", "-y", tool_name],  # RHEL/CentOS
+            ["pacman", "-S", "--noconfirm", tool_name],  # Arch
+        ]
+
+        for cmd in install_commands:
+            try:
+                subprocess.run(cmd, capture_output=True, check=True)
+                if self.is_tool_installed(tool_name):
+                    print(
+                        f"{Fore.GREEN}✅ Successfully installed {tool_name}{Style.RESET_ALL}"
+                    )
+                    return True
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+        print(f"{Fore.RED}❌ Failed to install {tool_name}{Style.RESET_ALL}")
+        return False
+
+    def convert_file(self, source_file: str, target_file: str):
+        """Main conversion logic"""
+        if not os.path.exists(source_file):
+            print(
+                f"{Fore.RED}❌ Error: Source file {source_file} does not exist{Style.RESET_ALL}"
+            )
+            return
+
+        source_ext = Path(source_file).suffix
+        target_ext = Path(target_file).suffix
+        conversion_key = self.get_conversion_key(source_ext, target_ext)
+
+        print(
+            f"{Fore.BLUE}🔄 Converting {source_file} -> {target_file} ({conversion_key}){Style.RESET_ALL}"
+        )
+
+        # Step 1: Check if converter already exists
+        if self.converter_exists(conversion_key):
+            print(
+                f"{Fore.GREEN}📁 Found existing converter for {conversion_key}{Style.RESET_ALL}"
+            )
+
+            # Try up to 10 times with fixes
+            for attempt in range(10):
+                success, error_msg = self.run_converter(
+                    conversion_key, source_file, target_file
+                )
+                if success:
+                    return
+
+                print(
+                    f"{Fore.YELLOW}🔧 Attempt {attempt + 1} failed, trying to fix...{Style.RESET_ALL}"
+                )
+                fixed_code = self.fix_converter(conversion_key, error_msg)
+                self.save_converter(conversion_key, fixed_code)
+
+            print(
+                f"{Fore.RED}💥 Failed after 10 attempts, will recreate converter{Style.RESET_ALL}"
+            )
+
+        # Step 2: Get conversion strategy from LLM
+        try:
+            strategy = self.get_conversion_strategy(source_ext, target_ext)
+            print(f"{Fore.GREEN}🎯 Strategy: {strategy.explanation}{Style.RESET_ALL}")
+        except Exception as e:
+            print(
+                f"{Fore.RED}❌ Failed to get conversion strategy: {e}{Style.RESET_ALL}"
+            )
+            return
+
+        # Step 3: Check for installed tools and create wrapper
+        converter_created = False
+
+        # Check preferred tool first, then others
+        for tool in [strategy.preferred_tool] + [
+            t for t in strategy.tools if t != strategy.preferred_tool
+        ]:
+            if self.is_tool_installed(tool):
+                print(f"{Fore.GREEN}🔧 Found installed tool: {tool}{Style.RESET_ALL}")
+                try:
+                    wrapper = self.get_python_wrapper(tool, source_ext, target_ext)
+                    self.save_converter(conversion_key, wrapper.code)
+                    converter_created = True
+                    break
+                except Exception as e:
+                    print(
+                        f"{Fore.YELLOW}⚠️  Failed to create wrapper for {tool}: {e}{Style.RESET_ALL}"
+                    )
+                    continue
+
+        # Step 4: Try pure Python conversion
+        if not converter_created:
+            try:
+                pure_converter = self.get_pure_python_converter(source_ext, target_ext)
+                print(
+                    f"{Fore.YELLOW}🐍 Using pure Python: {pure_converter.explanation}{Style.RESET_ALL}"
+                )
+                if pure_converter.limitations:
+                    print(
+                        f"{Fore.YELLOW}⚠️  Limitations: {pure_converter.limitations}{Style.RESET_ALL}"
+                    )
+                self.save_converter(conversion_key, pure_converter.code)
+                converter_created = True
+            except Exception as e:
+                print(
+                    f"{Fore.YELLOW}⚠️  Failed to create pure Python converter: {e}{Style.RESET_ALL}"
+                )
+
+        # Step 5: Try to install preferred tool
+        if not converter_created:
+            if self.try_install_tool(strategy.preferred_tool):
+                try:
+                    wrapper = self.get_python_wrapper(
+                        strategy.preferred_tool, source_ext, target_ext
+                    )
+                    self.save_converter(conversion_key, wrapper.code)
+                    converter_created = True
+                except Exception as e:
+                    print(
+                        f"{Fore.YELLOW}⚠️  Failed to create wrapper after installation: {e}{Style.RESET_ALL}"
+                    )
+
+        # Step 6: Give up
+        if not converter_created:
+            print(
+                f"{Fore.RED}💥 Unable to create converter for {conversion_key}{Style.RESET_ALL}"
+            )
+            return
+
+        # Try the new converter with self-healing
+        for attempt in range(10):
+            success, error_msg = self.run_converter(
+                conversion_key, source_file, target_file
+            )
+            if success:
+                return
+
+            print(
+                f"{Fore.YELLOW}🔧 New converter attempt {attempt + 1} failed, trying to fix...{Style.RESET_ALL}"
+            )
+            fixed_code = self.fix_converter(conversion_key, error_msg)
+            self.save_converter(conversion_key, fixed_code)
+
+        print(f"{Fore.RED}💥 Failed to convert after all attempts{Style.RESET_ALL}")
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(f"{Fore.RED}Usage: convert <source_file> <target_file>{Style.RESET_ALL}")
+        sys.exit(1)
+
+    source_file = sys.argv[1]
+    target_file = sys.argv[2]
+
+    converter = ConvertTool()
+    converter.convert_file(source_file, target_file)
+
+
+if __name__ == "__main__":
+    main()
