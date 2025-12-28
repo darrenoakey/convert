@@ -1,51 +1,100 @@
-# Convert Tool
+![](banner.jpg)
 
-![Banner Image](banner.jpg)
+# convert
+
+A self-healing file converter that automatically figures out how to convert between any file formats.
 
 ## Purpose
 
-The Convert Tool is a command-line utility designed to convert files from one format to another. It intelligently determines the best method for conversion and attempts to automate the process.
+`convert` is a command-line tool that converts files between different formats without requiring you to know which tools or commands to use. Point it at a source file and tell it what format you want, and it handles the rest.
+
+The tool learns as it goes - once it successfully converts between two formats, it remembers how to do it for next time.
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8 or later
+- An OpenAI API key stored in your system keyring
+
+### Setup
+
+1. Store your OpenAI API key in the system keyring:
+   ```bash
+   keyring set openai api-key sk-your-api-key-here
+   ```
+
+2. Install Python dependencies:
+   ```bash
+   pip install openai pydantic colorama keyring
+   ```
+
+3. Make the script executable and place it in your PATH:
+   ```bash
+   chmod +x convert
+   ```
 
 ## Usage
-
-To use the Convert Tool, provide the source file and the desired target file as command-line arguments.
 
 ```bash
 convert <source_file> <target_file>
 ```
 
-## Examples
-
-1.  Convert a `.png` image to a `.jpg` image:
-
-    ```bash
-    convert image.png image.jpg
-    ```
-
-2.  Convert a `.txt` file to a `.pdf` file:
-
-    ```bash
-    convert document.txt document.pdf
-    ```
-
-## Installation
-
-1.  Ensure you have Python 3 installed.
-2.  Save the `convert` script to a directory on your system.
-3.  Make the script executable:
-
-    ```bash
-    chmod +x convert
-    ```
-4.  Place your OpenAI API key in `~/.openai/openai_api_key.txt`.
-5.  (Optional) Add the directory to your `PATH` environment variable for easy access from any terminal location.
-
-### Dependencies
-
-The script relies on the `openai` Python package. It will attempt to install other command-line tools as needed, but it's recommended to have common conversion tools (like `imagemagick`) pre-installed for optimal performance.
-
-Install the OpenAI package using pip:
+The target can be either a full filename or just an extension:
 
 ```bash
-pip install openai
+# Full filename
+convert photo.heic photo.jpg
+
+# Just the extension (creates photo.jpg in same directory)
+convert photo.heic jpg
+convert photo.heic .jpg
+```
+
+## Examples
+
+### Image Conversion
+
+```bash
+# Convert HEIC to JPEG
+convert vacation.heic vacation.jpg
+
+# Convert PNG to WebP
+convert logo.png webp
+
+# Convert RAW to JPEG
+convert photo.CR2 photo.jpg
+```
+
+### Document Conversion
+
+```bash
+# Convert Markdown to PDF
+convert report.md report.pdf
+
+# Convert DOCX to PDF
+convert document.docx pdf
+```
+
+### Audio/Video Conversion
+
+```bash
+# Convert WAV to MP3
+convert recording.wav recording.mp3
+
+# Convert MOV to MP4
+convert video.mov mp4
+
+# Convert FLAC to AAC
+convert song.flac song.aac
+```
+
+### Other Formats
+
+```bash
+# Convert SVG to PNG
+convert icon.svg icon.png
+
+# Convert CSV to JSON
+convert data.csv data.json
 ```

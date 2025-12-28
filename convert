@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import hashlib
 import re
+import keyring
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Type, TypeVar
@@ -70,14 +71,14 @@ class ConvertTool:
         self.client = openai.OpenAI(api_key=self.api_key)
 
     def read_api_key(self):
-        try:
-            with open(os.path.expanduser("~/.openai/openai_api_key.txt"), "r") as f:
-                return f.read().strip()
-        except FileNotFoundError:
+        key = keyring.get_password("openai", "api-key")
+        if key is None:
             print(
-                f"{Fore.RED}Error: Unable to find the OpenAI API key file at '~/.openai/openai_api_key.txt'.{Style.RESET_ALL}"
+                f"{Fore.RED}Error: OpenAI API key not found in keyring.{Style.RESET_ALL}\n"
+                f"Store it with: keyring set openai api-key sk-..."
             )
             sys.exit(1)
+        return key
 
     def ask_llm(self, prompt: str, response_type: Type[T], model: str = None) -> T:
         """Clean interface: ask LLM with a prompt and get back typed result"""
@@ -85,6 +86,7 @@ class ConvertTool:
 
         # Models that support structured outputs (in order of preference)
         models_to_try = [
+            "gpt-5",
             "gpt-4.1",
             "gpt-4o-2024-08-06",
             "gpt-4o-mini-2024-07-18",
@@ -125,7 +127,7 @@ class ConvertTool:
         )
         try:
             completion = self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-5",
                 messages=[
                     {
                         "role": "system",
@@ -296,6 +298,7 @@ Please provide the fixed Python code and explain what changes were made."""
         print(f"{Fore.RED}❌ Failed to install {tool_name}{Style.RESET_ALL}")
         return False
 
+
     def convert_file(self, source_file: str, target_file: str):
         """Main conversion logic"""
         if not os.path.exists(source_file):
@@ -304,8 +307,20 @@ Please provide the fixed Python code and explain what changes were made."""
             )
             return
 
-        source_ext = Path(source_file).suffix
-        target_ext = Path(target_file).suffix
+        source_path = Path(source_file)
+        target_path = Path(target_file)
+        
+        # If target has no extension or is just an extension, treat it as an extension to add to source filename
+        if not target_path.suffix or target_file.startswith('.'):
+            # target_file is just an extension like "png" or ".png"
+            extension = target_file.lstrip('.')  # Remove leading dot if present
+            source_stem = source_path.stem  # filename without extension
+            target_file = str(source_path.parent / f"{source_stem}.{extension}")
+            target_path = Path(target_file)
+            print(f"{Fore.CYAN}📝 Interpreted as: {source_file} -> {target_file}{Style.RESET_ALL}")
+
+        source_ext = source_path.suffix
+        target_ext = target_path.suffix
         conversion_key = self.get_conversion_key(source_ext, target_ext)
 
         print(
