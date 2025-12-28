@@ -2,37 +2,30 @@
 
 # convert
 
-A self-healing file converter that automatically figures out how to convert between any file formats.
+A self-healing file format conversion tool that automatically figures out how to convert between any file formats.
 
 ## Purpose
 
-`convert` is a command-line tool that converts files between different formats without requiring you to know which tools or commands to use. Point it at a source file and tell it what format you want, and it handles the rest.
+`convert` is a command-line tool that converts files between different formats. Point it at any file and tell it what format you want - it handles the rest automatically.
 
-The tool learns as it goes - once it successfully converts between two formats, it remembers how to do it for next time.
+The tool:
+- Automatically selects the best conversion method for your file types
+- Creates and caches converters for future use
+- Self-heals when conversions fail, automatically fixing issues and retrying
 
 ## Installation
 
-### Prerequisites
+Requires Python 3.8+ and the following dependencies:
 
-- Python 3.8 or later
-- An OpenAI API key stored in your system keyring
+```bash
+pip install pydantic colorama claude-agent-sdk
+```
 
-### Setup
+Make the script executable:
 
-1. Store your OpenAI API key in the system keyring:
-   ```bash
-   keyring set openai api-key sk-your-api-key-here
-   ```
-
-2. Install Python dependencies:
-   ```bash
-   pip install openai pydantic colorama keyring
-   ```
-
-3. Make the script executable and place it in your PATH:
-   ```bash
-   chmod +x convert
-   ```
+```bash
+chmod +x convert
+```
 
 ## Usage
 
@@ -40,61 +33,47 @@ The tool learns as it goes - once it successfully converts between two formats, 
 convert <source_file> <target_file>
 ```
 
-The target can be either a full filename or just an extension:
+Or use shorthand notation with just the target extension:
 
 ```bash
-# Full filename
-convert photo.heic photo.jpg
-
-# Just the extension (creates photo.jpg in same directory)
-convert photo.heic jpg
-convert photo.heic .jpg
+convert <source_file> <target_extension>
 ```
 
 ## Examples
 
-### Image Conversion
+Convert an image from PNG to JPEG:
 
 ```bash
-# Convert HEIC to JPEG
-convert vacation.heic vacation.jpg
-
-# Convert PNG to WebP
-convert logo.png webp
-
-# Convert RAW to JPEG
-convert photo.CR2 photo.jpg
+convert photo.png photo.jpg
 ```
 
-### Document Conversion
+Using shorthand extension notation:
 
 ```bash
-# Convert Markdown to PDF
-convert report.md report.pdf
+convert photo.png jpg
+convert photo.png .jpg
+```
 
-# Convert DOCX to PDF
+Convert a video file:
+
+```bash
+convert video.mov video.mp4
+```
+
+Convert an audio file:
+
+```bash
+convert song.wav mp3
+```
+
+Convert a document:
+
+```bash
 convert document.docx pdf
 ```
 
-### Audio/Video Conversion
+## Notes
 
-```bash
-# Convert WAV to MP3
-convert recording.wav recording.mp3
-
-# Convert MOV to MP4
-convert video.mov mp4
-
-# Convert FLAC to AAC
-convert song.flac song.aac
-```
-
-### Other Formats
-
-```bash
-# Convert SVG to PNG
-convert icon.svg icon.png
-
-# Convert CSV to JSON
-convert data.csv data.json
-```
+- First-time conversions for a format pair may take longer as the tool sets up the converter
+- Subsequent conversions of the same format pair use the cached converter
+- Converter scripts are stored in the `convert_data` directory alongside the tool

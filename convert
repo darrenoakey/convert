@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
+#
+# convert - File format conversion tool using Claude Agent SDK
+#
+# Uses Claude Agent SDK instead of OpenAI API.
+# Authentication is handled via Claude Code CLI (no API key needed).
+#
 
 import sys
 import os
 import json
-import openai
-import time
+import asyncio
 import subprocess
-import shutil
-import hashlib
-import re
-import keyring
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Type, TypeVar
+
 from pydantic import BaseModel, Field
-from colorama import Fore, Back, Style, init
+from colorama import Fore, Style, init
+from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock
 
 # Initialize colorama
 init(autoreset=True)
@@ -64,89 +67,51 @@ class FixedConverter(BaseModel):
 
 class ConvertTool:
     def __init__(self):
-        self.api_key = self.read_api_key()
         self.script_dir = Path(__file__).parent
         self.convert_data_dir = self.script_dir / "convert_data"
         self.convert_data_dir.mkdir(exist_ok=True)
-        self.client = openai.OpenAI(api_key=self.api_key)
 
-    def read_api_key(self):
-        key = keyring.get_password("openai", "api-key")
-        if key is None:
-            print(
-                f"{Fore.RED}Error: OpenAI API key not found in keyring.{Style.RESET_ALL}\n"
-                f"Store it with: keyring set openai api-key sk-..."
-            )
-            sys.exit(1)
-        return key
-
-    def ask_llm(self, prompt: str, response_type: Type[T], model: str = None) -> T:
+    async def ask_llm(self, prompt: str, response_type: Type[T]) -> T:
         """Clean interface: ask LLM with a prompt and get back typed result"""
-        print(f"{Fore.CYAN}🤖 Asking LLM: {prompt[:100]}...{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}🤖 Asking Claude: {prompt[:100]}...{Style.RESET_ALL}")
 
-        # Models that support structured outputs (in order of preference)
-        models_to_try = [
-            "gpt-5",
-            "gpt-4.1",
-            "gpt-4o-2024-08-06",
-            "gpt-4o-mini-2024-07-18",
-            "gpt-4o-mini",
-            "gpt-4o",
-        ]
+        # Include schema in prompt to guide JSON response
+        schema = response_type.model_json_schema()
+        full_prompt = f"""You are a helpful assistant. Respond with valid JSON that matches this structure:
 
-        if model:
-            models_to_try.insert(0, model)
+{json.dumps(schema, indent=2)}
 
-        # Try structured outputs first
-        for model_name in models_to_try:
-            try:
-                print(
-                    f"{Fore.CYAN}🔄 Trying {model_name} with structured outputs...{Style.RESET_ALL}"
-                )
-                completion = self.client.beta.chat.completions.parse(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format=response_type,
-                )
+User request: {prompt}
 
-                result = completion.choices[0].message.parsed
-                print(
-                    f"{Fore.GREEN}✅ Got typed response from {model_name}{Style.RESET_ALL}"
-                )
-                return result
+Respond ONLY with valid JSON, no markdown code blocks or other text."""
 
-            except Exception as e:
-                print(
-                    f"{Fore.YELLOW}⚠️  {model_name} failed: {str(e)[:100]}...{Style.RESET_ALL}"
-                )
-                continue
+        response_text = ""
 
-        # Fallback to JSON mode with manual parsing
-        print(
-            f"{Fore.YELLOW}🔄 Falling back to JSON mode with manual parsing{Style.RESET_ALL}"
-        )
-        try:
-            completion = self.client.chat.completions.create(
-                model="gpt-5",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"You are a helpful assistant. Respond with valid JSON that matches this structure: {response_type.model_json_schema()}",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
+        async for message in query(
+            prompt=full_prompt,
+            options=ClaudeAgentOptions(
+                allowed_tools=[],  # No tools needed
+                permission_mode="bypassPermissions"
             )
+        ):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        response_text += block.text
 
-            content = completion.choices[0].message.content
-            response_data = json.loads(content)
-            result = response_type.model_validate(response_data)
-            print(f"{Fore.GREEN}✅ Fallback JSON parsing succeeded{Style.RESET_ALL}")
-            return result
+        # Parse JSON from response (may be wrapped in markdown code blocks)
+        text = response_text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = lines[1:]  # Remove opening ```json or ```
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]  # Remove closing ```
+            text = "\n".join(lines)
 
-        except Exception as final_error:
-            print(f"{Fore.RED}❌ All methods failed: {final_error}{Style.RESET_ALL}")
-            raise
+        response_data = json.loads(text)
+        result = response_type.model_validate(response_data)
+        print(f"{Fore.GREEN}✅ Got typed response from Claude{Style.RESET_ALL}")
+        return result
 
     def get_conversion_key(self, source_ext: str, target_ext: str) -> str:
         """Generate a unique key for this conversion type"""
@@ -160,15 +125,15 @@ class ConvertTool:
         """Check if we already have a converter for this conversion"""
         return self.get_converter_path(conversion_key).exists()
 
-    def get_conversion_strategy(
+    async def get_conversion_strategy(
         self, source_ext: str, target_ext: str
     ) -> ConversionStrategy:
         """Ask LLM for the best tools to convert between formats"""
-        prompt = f"""I need to convert files from {source_ext} to {target_ext}. 
-        What are the best command line tools for this conversion? 
+        prompt = f"""I need to convert files from {source_ext} to {target_ext}.
+        What are the best command line tools for this conversion?
         List them in order of preference and explain why the preferred tool is best."""
 
-        return self.ask_llm(prompt, ConversionStrategy)
+        return await self.ask_llm(prompt, ConversionStrategy)
 
     def is_tool_installed(self, tool_name: str) -> bool:
         """Check if a command line tool is installed"""
@@ -180,7 +145,7 @@ class ConvertTool:
             print(f"{Fore.YELLOW}❌ {tool_name} not found{Style.RESET_ALL}")
             return False
 
-    def get_python_wrapper(
+    async def get_python_wrapper(
         self, tool_name: str, source_ext: str, target_ext: str
     ) -> PythonConverter:
         """Get Python wrapper code for a command line tool"""
@@ -194,23 +159,23 @@ Requirements:
 
 Return the complete Python code, dependencies needed, and explanation."""
 
-        return self.ask_llm(prompt, PythonConverter)
+        return await self.ask_llm(prompt, PythonConverter)
 
-    def get_pure_python_converter(
+    async def get_pure_python_converter(
         self, source_ext: str, target_ext: str
     ) -> PurePythonConverter:
         """Get pure Python conversion code without external tools"""
         prompt = f"""Create a pure Python script to convert from {source_ext} to {target_ext} using only Python libraries like PIL, etc.
 
 Requirements:
-- Take source_file and target_file as sys.argv[1] and sys.argv[2]  
+- Take source_file and target_file as sys.argv[1] and sys.argv[2]
 - Use only standard Python libraries or common packages like PIL/Pillow
 - Include proper error handling and quality settings
 - Make it a complete, runnable script
 
 Return the complete Python code, dependencies, explanation, and any limitations."""
 
-        return self.ask_llm(prompt, PurePythonConverter)
+        return await self.ask_llm(prompt, PurePythonConverter)
 
     def save_converter(self, conversion_key: str, code: str):
         """Save converter code to file"""
@@ -250,7 +215,7 @@ Return the complete Python code, dependencies, explanation, and any limitations.
             print(f"{Fore.RED}❌ {error_msg}{Style.RESET_ALL}")
             return False, error_msg
 
-    def fix_converter(self, conversion_key: str, error_message: str) -> str:
+    async def fix_converter(self, conversion_key: str, error_message: str) -> str:
         """Ask LLM to fix converter code based on error"""
         converter_path = self.get_converter_path(conversion_key)
 
@@ -268,7 +233,7 @@ Error encountered: {error_message}
 
 Please provide the fixed Python code and explain what changes were made."""
 
-        fixed = self.ask_llm(prompt, FixedConverter)
+        fixed = await self.ask_llm(prompt, FixedConverter)
         print(f"{Fore.YELLOW}🔧 Fix applied: {fixed.changes_made}{Style.RESET_ALL}")
         return fixed.code
 
@@ -298,8 +263,7 @@ Please provide the fixed Python code and explain what changes were made."""
         print(f"{Fore.RED}❌ Failed to install {tool_name}{Style.RESET_ALL}")
         return False
 
-
-    def convert_file(self, source_file: str, target_file: str):
+    async def convert_file(self, source_file: str, target_file: str):
         """Main conversion logic"""
         if not os.path.exists(source_file):
             print(
@@ -309,7 +273,7 @@ Please provide the fixed Python code and explain what changes were made."""
 
         source_path = Path(source_file)
         target_path = Path(target_file)
-        
+
         # If target has no extension or is just an extension, treat it as an extension to add to source filename
         if not target_path.suffix or target_file.startswith('.'):
             # target_file is just an extension like "png" or ".png"
@@ -344,7 +308,7 @@ Please provide the fixed Python code and explain what changes were made."""
                 print(
                     f"{Fore.YELLOW}🔧 Attempt {attempt + 1} failed, trying to fix...{Style.RESET_ALL}"
                 )
-                fixed_code = self.fix_converter(conversion_key, error_msg)
+                fixed_code = await self.fix_converter(conversion_key, error_msg)
                 self.save_converter(conversion_key, fixed_code)
 
             print(
@@ -353,7 +317,7 @@ Please provide the fixed Python code and explain what changes were made."""
 
         # Step 2: Get conversion strategy from LLM
         try:
-            strategy = self.get_conversion_strategy(source_ext, target_ext)
+            strategy = await self.get_conversion_strategy(source_ext, target_ext)
             print(f"{Fore.GREEN}🎯 Strategy: {strategy.explanation}{Style.RESET_ALL}")
         except Exception as e:
             print(
@@ -371,7 +335,7 @@ Please provide the fixed Python code and explain what changes were made."""
             if self.is_tool_installed(tool):
                 print(f"{Fore.GREEN}🔧 Found installed tool: {tool}{Style.RESET_ALL}")
                 try:
-                    wrapper = self.get_python_wrapper(tool, source_ext, target_ext)
+                    wrapper = await self.get_python_wrapper(tool, source_ext, target_ext)
                     self.save_converter(conversion_key, wrapper.code)
                     converter_created = True
                     break
@@ -384,7 +348,7 @@ Please provide the fixed Python code and explain what changes were made."""
         # Step 4: Try pure Python conversion
         if not converter_created:
             try:
-                pure_converter = self.get_pure_python_converter(source_ext, target_ext)
+                pure_converter = await self.get_pure_python_converter(source_ext, target_ext)
                 print(
                     f"{Fore.YELLOW}🐍 Using pure Python: {pure_converter.explanation}{Style.RESET_ALL}"
                 )
@@ -403,7 +367,7 @@ Please provide the fixed Python code and explain what changes were made."""
         if not converter_created:
             if self.try_install_tool(strategy.preferred_tool):
                 try:
-                    wrapper = self.get_python_wrapper(
+                    wrapper = await self.get_python_wrapper(
                         strategy.preferred_tool, source_ext, target_ext
                     )
                     self.save_converter(conversion_key, wrapper.code)
@@ -431,13 +395,13 @@ Please provide the fixed Python code and explain what changes were made."""
             print(
                 f"{Fore.YELLOW}🔧 New converter attempt {attempt + 1} failed, trying to fix...{Style.RESET_ALL}"
             )
-            fixed_code = self.fix_converter(conversion_key, error_msg)
+            fixed_code = await self.fix_converter(conversion_key, error_msg)
             self.save_converter(conversion_key, fixed_code)
 
         print(f"{Fore.RED}💥 Failed to convert after all attempts{Style.RESET_ALL}")
 
 
-def main():
+async def async_main():
     if len(sys.argv) != 3:
         print(f"{Fore.RED}Usage: convert <source_file> <target_file>{Style.RESET_ALL}")
         sys.exit(1)
@@ -446,7 +410,11 @@ def main():
     target_file = sys.argv[2]
 
     converter = ConvertTool()
-    converter.convert_file(source_file, target_file)
+    await converter.convert_file(source_file, target_file)
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
