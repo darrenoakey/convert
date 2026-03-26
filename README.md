@@ -77,3 +77,7 @@ convert document.docx pdf
 - First-time conversions for a format pair may take longer as the tool sets up the converter
 - Subsequent conversions of the same format pair use the cached converter
 - Converter scripts are stored in the `convert_data` directory alongside the tool
+
+## License
+
+This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev) - free to use and modify, but no commercial use without permission.
